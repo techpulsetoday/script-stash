@@ -1,7 +1,7 @@
 #!/bin/bash
 # reformulate.sh
 # Author: Vedant Puri
-# Version: 2.0.1
+# Version: 2.0.3
 
 # ----- ENVIRONMENT & CONSOLE
 
@@ -11,7 +11,7 @@ bold="$(tput bold)"
 normal="$(tput sgr0)"
 
 # Script information
-script_version="2.0.1"
+script_version="2.0.3"
 
 # Environment information with defaults
 output="/dev/stdout"
@@ -21,9 +21,14 @@ formula_file=""
 current_tag_name=""
 latest_tag_name=""
 retrieved_sha256=""
+username=""
 temp_dir="updater_temp/"
 commit=false
 
+# Error Messages
+conn_error="Not Connected to the internet, please try again later. Quitting..."
+push_error="Couldn't push to GitHub: Not connected to the internet, please push changes yourself when connected. Quitting..."
+invalid_formula="Invalid Formula File Provided. Check Requirements and Try Again. Quitting..."
 
 # ----- SCRIPT SUPPORT
 
@@ -39,26 +44,47 @@ print_usage() {
   ${underline}-v${normal}        Prints script version
   ${underline}-h${normal}        Prints script usage
   ${underline}-ff=${normal}      Updates the specified formula file
-  ${underline}-c${normal}        Automatically commit changes to master branch"
+  ${underline}-c${normal}        Automatically commits changes to master branch"
 }
 
 
 # ----- REFORMULATE PROJECT MANAGEMENT
 
+# Preliminary check for requirements
+check_requirements() {
+  if [[ -z "$(command -v wget)" || -z "$(command -v git)" ]]
+  then
+    echo -e "${bold}Could not run:${normal} One or more requirements not met. Refer to the README for Requirements." && exit
+  fi
+}
+
+# Check Network connectivity
+check_network_conn() {
+  wget -q --spider http://github.com
+  local conn_stat=$(echo $?)
+  if [[ "${conn_stat}" != "0" ]]
+  then
+    echo "${1}" && exit
+  fi
+}
+
 # Extract info about repository
 extract_information() {
-  if [[ -z "${formula_file}" ]]
-  then
-    echo "No formula file provided." && exit
-  fi
   echo "${bold}Extracting relevant information...${normal}"
   local git_config_file="${given_project_path}.git/config"
   if [[ ! -f "${git_config_file}" ]]
   then
-    echo "Not a git repo" && exit
+    echo -e "Not a git repo. \nQuitting..." && exit
   fi
   local url="$(awk '/url/{print  $2}' "${given_project_path}${formula_file}" | cut -f4- -d/)"
+
   git_repo="$(echo ${url} | cut -d '/' -f 1,2)"
+  if [[ -z "${git_repo}" ]]
+  then
+    echo "${invalid_formula}" && exit
+  fi
+
+  username="$(echo ${git_repo} | cut -d '/' -f 1)"
   echo "Extraction complete."
 
 }
@@ -66,7 +92,25 @@ extract_information() {
 # Retreive name of latest release
 get_latest_tag() {
   echo "${bold}Retrieving latest release name...${normal}"
-  latest_tag_name="$(curl -s https://api.github.com/repos/"${git_repo}"/releases/latest |  sed -n 's|.*"tag_name": "\(.*\)",|\1|p')"
+
+  check_network_conn "${conn_error}"
+
+  # Rate limit checking
+  local rate_limit="$(curl -i -s https://api.github.com/users/"${username}" | grep "X-RateLimit-Remaining:"| cut -d " " -f2 | tr -d '\r')"
+  if [[ "${rate_limit}" -lt 2 ]]
+  then
+    echo -e "\nYour current rate limit is insufficient to carry out this operation. You could wait for an hour and retry, or authenticate yourself and increase Rate Limit. \n"
+    read -r -p "Would you like to authenticate yourself to GitHub ?[y/n] " response
+    if [[ "${response}" =~ ^([yY][eE][sS]|[yY])+$ ]]
+    then
+      latest_tag_name="$(curl -u "${username}" -s https://api.github.com/repos/"${git_repo}"/releases/latest |  sed -n 's|.*"tag_name": "\(.*\)",|\1|p')"
+    else
+      echo "Please try again after an hour. Quitting..." && exit
+    fi
+  else
+    latest_tag_name="$(curl -s https://api.github.com/repos/"${git_repo}"/releases/latest |  sed -n 's|.*"tag_name": "\(.*\)",|\1|p')"
+  fi
+
   if [[ -z "${latest_tag_name}" ]]
   then
     echo "No releases exist for ${git_repo}."
@@ -75,14 +119,15 @@ get_latest_tag() {
   current_tag_name="$(awk '/version/{print $NF}' ${formula_file})"
   if [[ ! -z "${current_tag_name}" && "${current_tag_name}" == "\"${latest_tag_name}\"" ]]
   then
-    echo "No new release detected. Formula up-to-date" && exit
+    echo "No new release detected. Formula up-to-date." && exit
   fi
-  echo "Tag name ${latest_tag_name} retreived."
+  echo "Tag name ${latest_tag_name} retrieved."
 }
 
 # Generate sha256 of latest release file
 retreive_sha256() {
-  echo "${bold}Generating file hash${normal}"
+  echo "${bold}Generating file hash...${normal}"
+  check_network_conn "${conn_error}"
   mkdir -p "${temp_dir}"
   $(wget -q  https://github.com/"${git_repo}"/archive/"${latest_tag_name}".tar.gz -P "${temp_dir}")
   local sha256_output="$(shasum -a 256 "${temp_dir}${latest_tag_name}".tar.gz)"
@@ -95,20 +140,30 @@ retreive_sha256() {
 update_formula() {
   echo "${bold}Updating Formula file...${normal}"
   local new_url="https://github.com/${git_repo}/archive/${latest_tag_name}.tar.gz"
-  $(sed -i '' "s|.*url.*|  url \"${new_url}\"|"  "${formula_file}")
-  $(sed -i '' "s|.*version.*|  version \"${latest_tag_name}\"|"  "${formula_file}")
-  $(sed -i '' "s|.*sha256.*|  sha256 \"${retrieved_sha256}\"|"  "${formula_file}")
+  sed -i '' "s|.*url.*|  url \"${new_url}\"|"  "${formula_file}"
+  sed -i '' "s|.*version.*|  version \"${latest_tag_name}\"|"  "${formula_file}"
+  sed -i '' "s|.*sha256.*|  sha256 \"${retrieved_sha256}\"|"  "${formula_file}"
   echo "Update complete."
 }
 
+# Perform commit and push to GitHub
 commit_changes() {
   if [[ "${commit}" == "true" ]]
   then
     echo "${bold}Comitting changes...${normal}"
     git add "$formula_file"
     git commit -m "Update formula for \"${git_repo}\" to ${latest_tag_name}"
+    check_network_conn "${push_error}"
     git push origin master
-    echo "Changes pushed to GitHub."
+
+    # verify commit
+    remote=$(git ls-remote -h origin master | awk '{print $1}')
+    local=$(git rev-parse HEAD)
+    if [[ $local == $remote ]]; then
+      echo "Changes successfully pushed to GitHub and verified."
+    else
+      echo "${push_error}" && exit
+    fi
   fi
 }
 
@@ -143,6 +198,7 @@ parse_args() {
 
 # Script Execution
 parse_args "${@}"
+check_requirements
 extract_information
 get_latest_tag
 retreive_sha256
